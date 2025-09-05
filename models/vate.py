@@ -6,168 +6,115 @@ from torch.optim import Adam, Optimizer
 from tqdm import tqdm
 from typing import Dict, Any, Optional, Tuple, List, Union
 from os import PathLike
+from models.layers import BaseEncoder, BaseDecoder, Transition
 
+LOG2PI = math.log(2.0 * math.pi) 
 
 class VATE(nn.Module):
 
     def __init__(
         self,
-        encoder: nn.Module,
-        transition: nn.Module,
-        target_decoders: Dict[str, nn.Module],
-        loss_fn_targets: Dict[str, nn.Module], 
+        encoder: BaseEncoder,
+        transition: Transition,
+        target_decoders: Dict[str, BaseDecoder],
     ):
         super().__init__()
         self.encoder = encoder
         self.transition = transition
         self.target_decoders = nn.ModuleDict(target_decoders)
-        self.loss_fn_targets = nn.ModuleDict(loss_fn_targets)
 
-
+    # Forward should just produce all the means, logvars, z samples, target predictions
     def forward(self, x: torch.Tensor, K: int = 1) -> Dict[str, Any]:
-
-        B, T, F = x.shape # (batch_size, window_len, n_features)
-
-        # Repeat input for K samples
-        # TODO: check which one is faster (if they all give the same results)
-        # x_tiled = x.repeat_interleave(K, dim=0) # (K*B,T,F)
-        x_tiled = x.unsqueeze(0).expand(K, B, T, F)
-        # x_tiled = x.unsqueeze(0).repeat(K, 1, 1, 1).contiguous()
-
-
-        # Encode the input and get the latent samples and corresponding log-prob
-        # Note that it's not possible to encode x just once and then use the mean/logvar
-        # to sample K times, as the encoder is supposed to be autoregressive/recurrent so the
-        # each mu/logvar dependes on the sampled point at the previous timestep z_{t-1}
-        z_enc, log_q = self.encoder(x_tiled)  # (K,B,T,Z), (K,B,T)
-
-        # Get the prior transition probabilities
-        z_trans, log_p = self.transition(z_enc)     # (K,B,T-1)
-
-        # Get the prior at the first timestep (assume standard gaussian)
-        # log_p0 = -(torch.sum(z_enc[:, :, 0, :]**2, dim=-1) + math.log(2 * math.pi)) / 2  # (K,B)
-        log_p0 = -0.5 * (torch.sum(z_enc[:, :, 0, :]**2, dim=-1) + z_enc.size(-1) * math.log(2 * math.pi))
         
-        # z_mixed = torch.zeros_like(z_enc)
-        # z_mixed[:, :, 1:, :] = z_trans[:, :, :-1, :]
+        # Encode the input data
+        z_enc, mu_enc, logvar_enc = self.encoder(x)
+
+        # One step transition
+        z_trans, mu_trans, logvar_trans = self.transition(z_enc)
         
-        # Decoder predictions per sample        
+        # Decoder predictions (from samples, not averages)
+        # TODO: Could use a mix of z_enc and z_trans if needed        
         target_preds: Dict[str, torch.Tensor] = {}
         for name, decoder in self.target_decoders.items():
             target_preds[name] = decoder(z_enc) 
 
-        return {'z_enc': z_enc, 'log_p': log_p, 'log_q': log_q, 'log_p0': log_p0, 'target_preds': target_preds}
+        return {'z_enc': z_enc, 'mu_enc': mu_enc, 'logvar_enc': logvar_enc,
+                'z_trans': z_trans, 'mu_trans': mu_trans, 'logvar_trans': logvar_trans,
+                'target_preds': target_preds}
     
 
-    # Compute the log-prob of the targets labels
-    def compute_decoder_logprob(self, targets: Dict[str, torch.Tensor], target_preds: Dict[str, torch.Tensor]):
+    # Used in IW-ELBO
+    def get_log_probs(self, forward_output: Dict[str, Any], target_labels: torch.Tensor):
 
-        # Infer K, B from any head
-        first_pred = next(iter(target_preds.values()))
-        K, B, T = first_pred.shape[:3]
+        z_enc, mu_enc, logvar_enc = forward_output['z_enc'], forward_output['mu_enc'], forward_output['logvar_enc']
+        z_trans, mu_trans, logvar_trans = forward_output['z_trans'], forward_output['mu_trans'], forward_output['logvar_trans']
+        target_preds = forward_output['target_preds']
+
+        # Compute log_p(z_t | z_{t-1}) and log_q(z_t | z_{t-1}, x_{0:t})
+        log_q = self.encoder.log_prob(z_enc, mu_enc, logvar_enc)
+        log_p = self.transition.log_prob(z_enc[..., 1:, :],
+                                         mu_trans[..., :-1, :],
+                                         logvar_trans[..., :-1, :])
+
+        # Isolate t=0 and remove the prior sample at t+1
+        log_q_0 = log_q[..., 0]
+        log_q = log_q[..., 1:]
+
+        # Assume the p_0 is just a standard gaussian
+        log_p_0 = -0.5 * (torch.sum(z_enc[..., 0, :]**2, dim=-1) + z_enc.shape[-1] * LOG2PI)
+
+        # Compute the label-decoders log-p
         log_p_decoders = dict()
 
         # Cycle through each head (different target labels)
-        for name, preds_k in target_preds.items():
+        for name, pred in target_preds.items():
+            decoder = self.target_decoders[name]
+            true_label = target_labels[name]
+            log_p_decoders[name] = decoder.log_prob(pred, true_label) # type: ignore
+        
+        return {'log_p_0': log_p_0, 'log_q_0': log_q_0,
+                'log_p': log_p, 'log_q': log_q,
+                'log_p_decoders': log_p_decoders}
+        
 
-            loss_fn = self.loss_fn_targets[name]
+    def get_log_weights(self, log_prob_output: Dict[str, Any]):
 
-            # ----- Multiclass classification: CrossEntropyLoss -----
-            if isinstance(loss_fn, nn.CrossEntropyLoss):
-                # preds_k: (K,B,T,C), targets[name]: (B,T) with class indices
-                logits = preds_k
-                log_probs = F.log_softmax(logits, dim=-1)             # (K,B,T,C)
-                y = targets[name].unsqueeze(0).expand(K, -1, -1, -1)  # (K,B,T,1)
-                logp = log_probs.gather(dim=-1, index=y).squeeze(-1)  # (K,B,T)
-                logp_total = logp.sum(dim=2)                                 
-
-            # # ----- Regression (fixed var): MSELoss -> Gaussian with σ^2 = 1 (const dropped) -----
-            # elif isinstance(loss_fn, nn.MSELoss):
-            #     # preds_k: mean (K,B,T,...) , targets[name]: (B,T,...)
-            #     mu = preds_k
-            #     y = targets[name].unsqueeze(0).expand_as(mu)
-            #     se = (mu - y) ** 2
-            #     sum_dims = tuple(range(2, mu.dim()))                         # sum over time and features
-            #     logp_total = - 0.5 * se.sum(dim=sum_dims)
-
-            # # ----- Regression (heteroscedastic): GaussianNLLLoss -> provide (mu, logvar) -----
-            # elif isinstance(loss_fn, nn.GaussianNLLLoss):
-            #     # preds_k: tuple (mu, logvar), each (K,B,T,...) matching targets
-            #     mu, logvar = preds_k  # expect a tuple from your decoder
-            #     y = targets[name].unsqueeze(0).expand_as(mu)
-            #     inv_var = torch.exp(-logvar)
-            #     # log N(y | mu, var) up to additive constant
-            #     logp_elem = -0.5 * ((y - mu) ** 2 * inv_var + logvar)
-            #     sum_dims = tuple(range(2, mu.dim()))
-            #     logp_total = logp_elem.sum(dim=sum_dims)
-
-            # # Optional: L1Loss as Laplace(μ, b=1) up to const
-            # elif isinstance(loss_fn, nn.L1Loss):
-            #     mu = preds_k
-            #     y = targets[name].unsqueeze(0).expand_as(mu)
-            #     abs_err = (mu - y).abs()
-            #     sum_dims = tuple(range(2, mu.dim()))
-            #     logp_total = -abs_err.sum(dim=sum_dims)      
-
-            log_p_decoders[name] = logp_total          
-                                                
-        return log_p_decoders
-
-
-    def compute_log_weights(self, batch: Dict[str, Any], K: int = 1):
-
-        # Compute log(w) = log(p(y,z)/q(z|x))
-        x = batch['neural']
-        y_targets = batch['targets']
-        forward_outs = self.forward(x, K=K)
-
-        log_p = forward_outs['log_p'] 
-        log_q = forward_outs['log_q']
-        log_p0 = forward_outs['log_p0']
-        target_preds = forward_outs['target_preds']
+        log_p_0, log_q_0 = log_prob_output['log_p_0'], log_prob_output['log_q_0']
+        log_p, log_q = log_prob_output['log_p'], log_prob_output['log_q']
 
         # Prior term
-        log_w_prior = log_p0 - log_q[:, :, 0] 
+        log_w_prior = log_p_0 - log_q_0
 
-        # Transition terms
-        # log_w_trans = (log_p - log_q[:, :, 1:]).sum(dim=2) 
-        log_w_trans = (log_p - log_q[:, :, 1:].detach()).sum(dim=2) 
+        # Transition terms (summed over time)
+        # TODO: give the possibility to detach either term (or mix the two detached
+        # terms to get a weighted gradient.
+        log_w_trans = (log_p - log_q).sum(dim=-1) 
 
-        # Decoder terms
-        log_w_dec = self.compute_decoder_logprob(y_targets, target_preds)
+        # Decoder terms (summed over time)
+        log_w_dec = {name: log_p_dec.sum(dim=-1) for name, log_p_dec in log_prob_output['log_p_decoders'].items()}
 
         return log_w_prior, log_w_trans, log_w_dec
 
-    # def loss(self, log_w_prior, log_w_trans, log_w_dec):
 
-    #     # Compute log(w)
-    #     log_w = log_w_prior + log_w_trans + sum(log_w_dec.values())
+    def step_iw(self, batch: Dict[str, Any], K: int = 1) -> Dict[str, Any]:
 
-    #     # Subtract max trick for numerical stability
-    #     m = log_w.max(dim=0, keepdim=True).values
-    #     loss = -(torch.logsumexp(log_w - m, dim=0) + m.squeeze(0) - math.log(log_w.shape[0])).mean()
-    #     return loss
+        x = batch['neural']
+        y_targets = batch['targets']
 
-    # def step(self, batch: Dict[str, Any], K: int = 1) -> Dict[str, Any]:
+        x = x.unsqueeze(0).repeat(K, 1, 1, 1).contiguous()
+        # x = x.unsqueeze(0).expand(K, B, T, F)
+
+        # Forward pass
+        forward_output = self.forward(x, K=K)
+
+        # Log-prob computation
+        log_prob_output = self.get_log_probs(forward_output, y_targets)
+
+        # Log_w terms of the loss
+        log_w_prior, log_w_trans, log_w_dec = self.get_log_weights(log_prob_output)
         
-    #     # Compute the log_w terms (forward pass)
-    #     log_w_terms = self.compute_log_weights(batch, K)
-
-    #     # Compute the IW loss (all terms added together)
-    #     loss = self.loss(*log_w_terms)
-
-    #     # Compute the importance-weighted terms for debug and visualization
-
-
-    #     losses = {'total_loss': loss}
-
-    #     return losses
-
-
-    def step(self, batch: Dict[str, Any], K: int = 1) -> Dict[str, Any]:
-
-        # Forward pass terms
-        log_w_prior, log_w_trans, log_w_dec = self.compute_log_weights(batch, K)
+        # print(log_prob_output['log_p'].max().item(), log_prob_output['log_q'].max().item())
+        # print(log_w_trans.mean().item())
 
         # Compute S = log(w)
         S = log_w_prior + log_w_trans
@@ -246,7 +193,7 @@ class VATE(nn.Module):
             
             # Optimization step
             optimizer.zero_grad()
-            losses = self.step(batch, K=num_particles)
+            losses = self.step_iw(batch, K=num_particles)
             losses['total_loss'].backward()
             optimizer.step()
 
@@ -283,7 +230,7 @@ class VATE(nn.Module):
                 if x0 is None:
                     raise ValueError("generate: provide either x0 or z0")
                 x0 = x0.view(1,1,1,-1)
-                z_current, _ = self.encoder(x0)
+                z_current, _, _ = self.encoder(x0)
             else:
                 z_current = z0
 
@@ -297,7 +244,7 @@ class VATE(nn.Module):
             zs = [z_current]
             
             for _ in range(num_steps):
-                z_next, _ = self.transition(z_current)
+                z_next, _, _ = self.transition(z_current)
                 # mu, logvar = self.transition.get_gaussian_params(z_current)
                 # std = torch.exp(0.5 * logvar)
                 # eps = torch.randn_like(std)
@@ -322,8 +269,8 @@ class VATE(nn.Module):
 
         device = next(self.parameters()).device
 
-        dummy_x = torch.zeros((1,1,5,input_features), dtype=torch.float32, device=device)
-        dummy_z, _ = self.encoder(dummy_x)
+        dummy_x = torch.zeros((1,1,input_features), dtype=torch.float32, device=device)
+        dummy_z, _, _ = self.encoder(dummy_x)
         _ = self.transition(dummy_z)
 
         encoder_param_count = sum(p.numel() for p in self.encoder.parameters()) 
@@ -362,237 +309,4 @@ class VATE(nn.Module):
         state_dict = torch.load(path, map_location=map_location)
         self.load_state_dict(state_dict)
         return self
-    
-# ---------------------------------------------------------------------------- #
-#                                    Modules                                   #
-# ---------------------------------------------------------------------------- #
-def diag_normal_log_prob(x: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    return -0.5 * (
-        (x - mu).pow(2) * torch.exp(-logvar) + 
-        logvar + torch.log(torch.tensor(2.0 * torch.pi, device=x.device))
-    ).sum(dim=-1)
-
-
-class RecurrentEncoder(nn.Module):
-
-    def __init__(
-        self,
-        *,
-        rnn_module: nn.Module,
-        body_module: nn.Module,
-        latent_dim: int,
-        logvar_lims: Tuple[float, float] = (-9.0, 2.0),
-        fixed_logvar: Optional[float] = None,   # if not None, use this instead of a logvar head
-    ):
-        super().__init__()
-        self.rnn_module = rnn_module
-        self.body_module = body_module
-        self.latent_dim = int(latent_dim)
-        self.logvar_lims = logvar_lims
-
-        # Heads are inferred lazily from body_module output size
-        self.mean_layer = nn.LazyLinear(self.latent_dim)
-
-        if fixed_logvar is None:
-            self.logvar_layer = nn.LazyLinear(self.latent_dim)
-            self.register_buffer("logvar_const_buf", None, persistent=False)
-        else:
-            self.logvar_layer = None
-            self.register_buffer(
-                "logvar_const_buf",
-                torch.full((1, self.latent_dim), float(fixed_logvar))
-            )
-
-    def forward(self, x: torch.Tensor):
-        assert x.dim() == 4, "Encoder expects (K, B, T, F). Reshape in VATE before calling."
-        K, B, T, F = x.shape
-        KB = K * B
-
-        # RNN expects 3D -> flatten particles & batch (view, no copy if contiguous)
-        x_flat = x.reshape(KB, T, F)                       # (K*B, T, F)
-        h_seq, _ = self.rnn_module(x_flat)                 # (K*B, T, H)
-
-        # Autoregressive posterior calculation
-        # Start from z = 0 at t = -1 and autoregressively expand it
-        z_prev = torch.zeros(KB, self.latent_dim, device=x.device)
-        z_seq = []
-        log_q_seq = []
-
-        for t in range(T):
-            
-            # Get the context from the neural data and concatenate it with the previous z
-            h = h_seq[:, t, :]                         
-            s = torch.cat([h, z_prev], dim=-1)       
-
-            # Apply some non-linear layers
-            f = self.body_module(s)                    
-
-            # Get the mean and logvar for q(z_t | ...)
-            mu = self.mean_layer(f)                    
-
-            if self.logvar_layer is not None:
-                logvar = self.logvar_layer(f)    
-            else:
-                logvar = self.logvar_const_buf.expand_as(mu)
-            logvar = torch.clamp(logvar, *self.logvar_lims)
-
-            # Sample with the reparameterization trick
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            z = mu + std * eps                     
-
-            # Calculate the probability of this sample
-            log_q = diag_normal_log_prob(z, mu, logvar)
-
-            # Append to the sequences and go to the next step
-            z_seq.append(z)
-            log_q_seq.append(log_q)
-
-            z_prev = z
-
-        # Stack the sequences (to recover the time dimension) and reshape to separate K and B
-        z_seq = torch.stack(z_seq, dim=1).reshape(K, B, T, self.latent_dim)    # (K,B,T,Z)
-        log_q_seq = torch.stack(log_q_seq, dim=1).reshape(K, B, T)              # (K,B,T)
-
-        return z_seq, log_q_seq
-
-
-class TransitionModule(nn.Module):
-    """
-    IWAE-style transition:
-      forward(z_enc) -> z_next_samples, logp_tr
-        z_next_samples : (..., T-1, Z) sampled from p(z_t | z_{t-1})
-        logp_tr        : (..., T-1)    log p(z_t | z_{t-1}) evaluated at the provided z_enc
-
-    Residual modes:
-      - "plain"    : mu = v
-      - "residual" : mu = z_prev + v
-      - "tanh"     : mu = z_prev + residual_scale * tanh(v)
-      - "unit_step": mu = z_prev + residual_scale * normalize(v)
-    """
-    def __init__(
-        self,
-        *,
-        base_module: nn.Module,            # maps (..., Z) -> (..., H)
-        latent_dim: int,
-        residual_mode: str = "tanh",
-        residual_scale: float = 0.05,
-        logvar_lims: Tuple[float, float] = (-9.0, 2.0),
-        fixed_logvar: Optional[float] = None,   # if set, fixes transition variance
-    ):
-        super().__init__()
-        self.base_module = base_module
-        self.latent_dim = int(latent_dim)
-        self.residual_mode = residual_mode
-        self.residual_scale = float(residual_scale)
-        self.logvar_lims = logvar_lims
-
-        # Heads inferred lazily from base_module output
-        self.mean_layer = nn.LazyLinear(self.latent_dim)
-        if fixed_logvar is None:
-            self.logvar_layer = nn.LazyLinear(self.latent_dim)
-            self.register_buffer("logvar_const_buf", None, persistent=False)
-        else:
-            self.logvar_layer = None
-            self.register_buffer("logvar_const_buf", torch.full((1, self.latent_dim), float(fixed_logvar)))
-
-    def get_gaussian_params(self, z_prev: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        flat = z_prev.reshape(-1, z_prev.size(-1))      
-        h = self.base_module(flat)                 
-        v = self.mean_layer(h).reshape_as(z_prev)           
-
-        if self.residual_mode == "plain":
-            mu = v
-        elif self.residual_mode == "residual":
-            mu = z_prev + v
-        elif self.residual_mode == "tanh":
-            mu = z_prev + self.residual_scale * torch.tanh(v)
-        elif self.residual_mode == "unit_step":
-            u = v / (v.norm(dim=-1, keepdim=True) + 1e-6)
-            mu = z_prev + self.residual_scale * u
-
-        if self.logvar_layer is not None:
-            logvar = self.logvar_layer(h).reshape_as(z_prev)
-        else:
-            logvar = self.logvar_const_buf.expand_as(mu)
-
-        logvar = torch.clamp(logvar, *self.logvar_lims)
-        return mu, logvar
-
-
-
-    def forward(self, z_enc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        assert z_enc.dim() in (3, 4)
-
-        # Get the parameters (for all timesteps)
-        mu, logvar = self.get_gaussian_params(z_enc)
-
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        z_next = mu + std * eps      
-
-        # log p(z_t | z_{t-1}) evaluated at provided z_curr / z_prev
-        log_p_tr = diag_normal_log_prob(z_enc[:, :, 1:, :], mu[:, :, :-1, :], logvar[:, :, :-1, :])  # (..., T-1)
-        
-        return z_next, log_p_tr
-
-
-    # def forward(self, z_enc: torch.Tensor) -> torch.Tensor:
-
-    #     assert z_enc.dim() in (3, 4)
-    #     if z_enc.dim() == 3:
-    #         # (B, T, Z)
-    #         z_prev = z_enc[:, :-1, :]                       # (B, T-1, Z)
-    #         z_curr = z_enc[:,  1:, :]                       # (B, T-1, Z)
-    #     else:
-    #         # (K, B, T, Z)
-    #         z_prev = z_enc[:, :, :-1, :]                    # (K, B, T-1, Z)
-    #         z_curr = z_enc[:, :,  1:, :]                    # (K, B, T-1, Z)
-
-    #     # Get the parameters (for all timesteps)
-    #     mu, logvar = self.get_gaussian_params(z_prev)
-
-    #     # log p(z_t | z_{t-1}) evaluated at provided z_curr / z_prev
-    #     log_p_tr = diag_normal_log_prob(z_curr, mu, logvar)  # (..., T-1)
-    #     return log_p_tr
-
-
-    # def step(self, z: torch.Tensor) -> torch.Tensor:
-
-    #     mu, logvar = self.get_gaussian_params(z)
-
-    #     std = torch.exp(0.5 * logvar)
-    #     eps = torch.randn_like(std)
-    #     z_next = mu + std * eps                    
-
-    #     return z_next
-    
-
-class RecurrentDecoder(nn.Module):
-
-    def __init__(self, 
-                 rnn_module: nn.Module,
-                 decoder_module: nn.Module):
-        
-        super().__init__()
-        self.rnn_module = rnn_module
-        self.decoder_module = decoder_module
-
-    def forward(self, x):
-        
-        x_ndim = x.dim() 
-
-        if x_ndim == 4:
-            K, B = x.shape[0], x.shape[1]
-            x = x.flatten(0,1)
-
-        x, _ = self.rnn_module(x)
-        x = self.decoder_module(x)
-
-        if x_ndim == 4:
-            x = x.reshape(K, B, *x.shape[1:])
-
-        return x
     

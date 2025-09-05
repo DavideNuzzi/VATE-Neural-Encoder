@@ -393,7 +393,7 @@ def training_summary_plot_iw(model, dataset, losses, label_to_show=None, title_a
     # Training encoding
     x = dataset.neural.data.unsqueeze(0).unsqueeze(0)
 
-    z_encoded_train, _ = model.encoder(x)
+    z_encoded_train, _, _ = model.encoder(x)
     z_encoded_train = z_encoded_train.squeeze()
 
     if label_to_show is not None:
