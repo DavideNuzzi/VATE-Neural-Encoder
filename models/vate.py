@@ -4,11 +4,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam, Optimizer
 from tqdm import tqdm
-from typing import Dict, Any, Optional, Tuple, List, Union
+from typing import Dict, Any, Optional, Tuple, List, Union, Mapping
 from os import PathLike
 from models.layers import BaseEncoder, BaseDecoder, Transition
 
 LOG2PI = math.log(2.0 * math.pi) 
+
+def _kl_div_standard(mu, logvar):
+    return 0.5 * (logvar.exp() + mu**2 - logvar - 1)
+
+def _kl_div(mu_1, mu_2, logvar_1, logvar_2):
+    return 0.5 * ((logvar_1 - logvar_2).exp() + (mu_1 - mu_2)**2 / logvar_2.exp() +  logvar_2 - logvar_1 - 1)
+
 
 class VATE(nn.Module):
 
@@ -16,15 +23,18 @@ class VATE(nn.Module):
         self,
         encoder: BaseEncoder,
         transition: Transition,
-        target_decoders: Dict[str, BaseDecoder],
+        target_decoders: Mapping[str, BaseDecoder],
+        decode_from_posterior: bool = True
     ):
         super().__init__()
         self.encoder = encoder
         self.transition = transition
         self.target_decoders = nn.ModuleDict(target_decoders)
 
+        self.decode_from_posterior = decode_from_posterior
+
     # Forward should just produce all the means, logvars, z samples, target predictions
-    def forward(self, x: torch.Tensor, K: int = 1) -> Dict[str, Any]:
+    def forward(self, x: torch.Tensor) -> Dict[str, Any]:
         
         # Encode the input data
         z_enc, mu_enc, logvar_enc = self.encoder(x)
@@ -34,126 +44,93 @@ class VATE(nn.Module):
         
         # Decoder predictions (from samples, not averages)
         # TODO: Could use a mix of z_enc and z_trans if needed        
+        z_to_decode = z_enc
+        if not self.decode_from_posterior:
+            z_to_decode = torch.cat((z_enc[...,0:1,:], z_trans[..., :-1,:]), dim=-2)
+        
         target_preds: Dict[str, torch.Tensor] = {}
         for name, decoder in self.target_decoders.items():
-            target_preds[name] = decoder(z_enc) 
+            target_preds[name] = decoder(z_to_decode) 
 
         return {'z_enc': z_enc, 'mu_enc': mu_enc, 'logvar_enc': logvar_enc,
                 'z_trans': z_trans, 'mu_trans': mu_trans, 'logvar_trans': logvar_trans,
                 'target_preds': target_preds}
-    
-
-    # Used in IW-ELBO
-    def get_log_probs(self, forward_output: Dict[str, Any], target_labels: torch.Tensor):
-
-        z_enc, mu_enc, logvar_enc = forward_output['z_enc'], forward_output['mu_enc'], forward_output['logvar_enc']
-        z_trans, mu_trans, logvar_trans = forward_output['z_trans'], forward_output['mu_trans'], forward_output['logvar_trans']
-        target_preds = forward_output['target_preds']
-
-        # Compute log_p(z_t | z_{t-1}) and log_q(z_t | z_{t-1}, x_{0:t})
-        log_q = self.encoder.log_prob(z_enc, mu_enc, logvar_enc)
-        log_p = self.transition.log_prob(z_enc[..., 1:, :],
-                                         mu_trans[..., :-1, :],
-                                         logvar_trans[..., :-1, :])
-
-        # Isolate t=0 and remove the prior sample at t+1
-        log_q_0 = log_q[..., 0]
-        log_q = log_q[..., 1:]
-
-        # Assume the p_0 is just a standard gaussian
-        log_p_0 = -0.5 * (torch.sum(z_enc[..., 0, :]**2, dim=-1) + z_enc.shape[-1] * LOG2PI)
-
-        # Compute the label-decoders log-p
-        log_p_decoders = dict()
-
-        # Cycle through each head (different target labels)
-        for name, pred in target_preds.items():
-            decoder = self.target_decoders[name]
-            true_label = target_labels[name]
-            log_p_decoders[name] = decoder.log_prob(pred, true_label) # type: ignore
-        
-        return {'log_p_0': log_p_0, 'log_q_0': log_q_0,
-                'log_p': log_p, 'log_q': log_q,
-                'log_p_decoders': log_p_decoders}
-        
-
-    def get_log_weights(self, log_prob_output: Dict[str, Any]):
-
-        log_p_0, log_q_0 = log_prob_output['log_p_0'], log_prob_output['log_q_0']
-        log_p, log_q = log_prob_output['log_p'], log_prob_output['log_q']
-
-        # Prior term
-        log_w_prior = log_p_0 - log_q_0
-
-        # Transition terms (summed over time)
-        # TODO: give the possibility to detach either term (or mix the two detached
-        # terms to get a weighted gradient.
-        log_w_trans = (log_p - log_q).sum(dim=-1) 
-
-        # Decoder terms (summed over time)
-        log_w_dec = {name: log_p_dec.sum(dim=-1) for name, log_p_dec in log_prob_output['log_p_decoders'].items()}
-
-        return log_w_prior, log_w_trans, log_w_dec
 
 
-    def step_iw(self, batch: Dict[str, Any], K: int = 1) -> Dict[str, Any]:
+    # ------------------------------- Standard ELBO ------------------------------ #
+    def step_elbo(self, batch: Dict[str, Any]) -> Dict[str, Any]:
 
         x = batch['neural']
         y_targets = batch['targets']
 
-        x = x.unsqueeze(0).repeat(K, 1, 1, 1).contiguous()
-        # x = x.unsqueeze(0).expand(K, B, T, F)
+        # Forward pass
+        forward_output = self.forward(x)
+
+        z_enc, mu_enc, logvar_enc = forward_output['z_enc'], forward_output['mu_enc'], forward_output['logvar_enc']
+        z_trans, mu_trans, logvar_trans = forward_output['z_trans'], forward_output['mu_trans'], forward_output['logvar_trans']
+        target_preds = forward_output['target_preds']
+        
+        # Latent prior loss
+        mu_0, logvar_0 = mu_enc[:, 0], logvar_enc[:, 0]
+        loss_prior = _kl_div_standard(mu_0, logvar_0).sum(dim=-1).mean()
+        
+        # # Transition loss 
+        loss_transition = _kl_div(mu_enc[:, 1:, :], mu_trans[:, :-1, :],
+                                  logvar_enc[:, 1:, :], logvar_trans[:, :-1, :]).sum(dim=-1).sum(dim=-1).mean()
+
+        # Decoder losses
+        loss_targets = {}
+        for name, pred in target_preds.items():
+            
+            target_label_true = y_targets[name]
+            decoder = self.target_decoders[name] 
+            loss_targets[name] = decoder.loss(pred, target_label_true) # type: ignore
+
+        kl_weight = math.exp(-10)
+        total_loss = (loss_prior + loss_transition) * kl_weight + sum(loss_targets.values())
+
+        return {
+            'total_loss': total_loss,
+            'loss_prior': loss_prior,
+            'loss_transition': loss_transition,
+            'loss_targets': loss_targets,
+        }
+    
+
+    def step_elbo
+
+    # This is the basic, non-variational, approach
+    def step_basic(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+
+        x = batch['neural']
+        y_targets = batch['targets']
 
         # Forward pass
-        forward_output = self.forward(x, K=K)
+        forward_output = self.forward(x)
+        z_enc = forward_output['z_enc']
+        z_trans = forward_output['z_trans']
+        target_preds = forward_output['target_preds']
+        mu_enc = forward_output['mu_enc']
+        mu_trans = forward_output['mu_trans']
 
-        # Log-prob computation
-        log_prob_output = self.get_log_probs(forward_output, y_targets)
+        # loss_transition = ((z_enc[:, 1:, :] - z_trans[:, :-1, :])**2).sum(dim=-1).sum(dim=-1).mean()
+        loss_transition = ((mu_enc[:, 1:, :] - mu_trans[:, :-1, :])**2).sum(dim=-1).sum(dim=-1).mean()
 
-        # Log_w terms of the loss
-        log_w_prior, log_w_trans, log_w_dec = self.get_log_weights(log_prob_output)
-        
-        # print(log_prob_output['log_p'].max().item(), log_prob_output['log_q'].max().item())
-        # print(log_w_trans.mean().item())
+        loss_targets = {}
+        for name, pred in target_preds.items():
+            
+            target_label_true = y_targets[name]
+            decoder = self.target_decoders[name] 
+            loss_targets[name] = decoder.loss(pred, target_label_true) # type: ignore
 
-        # Compute S = log(w)
-        S = log_w_prior + log_w_trans
-        for v in log_w_dec.values():
-            S = S + v
+        total_loss = loss_transition * 10 + sum(loss_targets.values())
 
-        # Subtract max trick for numerical stability
-        S_max = S.max(dim=0, keepdim=True).values       # (1,B)
-        S_centered = S - S_max                          # (K,B)
-
-        # Compute IW-ELBO and loss
-        logsum = torch.logsumexp(S_centered, dim=0)     # (B,)
-        iw_elbo = logsum + S_max.squeeze(0) - math.log(S.size(0))
-        loss = -iw_elbo.mean()
-
-        # Diagnostics and visualizations
-        with torch.no_grad():
-
-            # Compute weights
-            w_tilde = torch.exp(S_centered - logsum.unsqueeze(0))  # (K,B)
-
-            # Compute the contribution of each term to the IW-ELBO
-            iw_init = (w_tilde * log_w_prior).sum(dim=0).mean()
-            iw_tr   = (w_tilde * log_w_trans).sum(dim=0).mean()
-            iw_dec  = {name: (w_tilde * v).sum(dim=0).mean() for name, v in log_w_dec.items()}
-
-            # Entropy correction term
-            logZ = torch.logsumexp(S_centered, dim=0, keepdim=True)   # (1,B)
-            H = -(w_tilde * (S_centered - logZ)).sum(dim=0)           # (B,)
-            entropy_term = (H - math.log(w_tilde.size(0))).mean()
-
-        losses = {
-            'total_loss': loss,
-            'entropy': -entropy_term.detach(),
-            'loss_prior': -iw_init.detach(),
-            'loss_transition': -iw_tr.detach(),
-            'loss_targets': {n: -v.detach() for n, v in iw_dec.items()}
+        return {
+            'total_loss': total_loss,
+            'loss_transition': loss_transition,
+            'loss_targets': loss_targets,
         }
-        return losses
+    
 
 
     def fit(self,
@@ -161,26 +138,27 @@ class VATE(nn.Module):
             iterations: int,
             batch_size: int = 128,
             window_len: int = 2,
-            num_particles: int = 5,
             optimizer: Optional[Optimizer] = None,
-            callbacks: Optional[List[Any]] = None,
+            variational_loss: bool = True,
             show_progress: bool = True
             ) -> Dict[str, List[float]]:
-    
+
+        # Set the model in training mode
         self.train()
 
-        # Optimizer ----------------------------------------------------------------
+        # Instantiate an optimizer if not provided 
         if optimizer is None:
             optimizer = Adam(self.parameters(), lr=3e-4)
 
-        # Loss history -------------------------------------------------------------
-        history = {'total_loss': [], 'loss_transition': [], 'loss_prior': [], 'entropy': []}
-        history.update({f'loss_targets_{n}': [] for n in self.target_decoders})
-
+        # Check if the dataset is long enough for the training
         max_start = dataset.T - window_len
         if max_start < 0:
             raise ValueError(f'window_len={window_len} is longer than the sequence ({dataset.T}).')
 
+        # Loss history
+        history = dict()
+
+        # Initialize the progress bar and start training
         pbar = tqdm(range(iterations), disable=not show_progress)
 
         for it in pbar:
@@ -193,20 +171,30 @@ class VATE(nn.Module):
             
             # Optimization step
             optimizer.zero_grad()
-            losses = self.step_iw(batch, K=num_particles)
+
+            if variational_loss:
+                losses = self.step_elbo(batch)
+            else:
+                losses = self.step_basic(batch)
+
             losses['total_loss'].backward()
             optimizer.step()
 
-            # Track losses
-            history['total_loss'].append(losses['total_loss'].item())
-            history['loss_transition'].append(losses['loss_transition'].item())
-            history['loss_prior'].append(losses['loss_prior'].item())
-            history['entropy'].append(losses['entropy'].item())
-
-            for n, l in losses['loss_targets'].items():
-                history[f'loss_targets_{n}'].append(l.item())
-            # for n, l in losses['loss_nuisances'].items():
-            #     history[f'loss_nuisances_{n}'].append(l.item())
+            # Statistics tracking
+            
+            # At first iteration initialize a list for each stat and handle the nested lists
+            # Then add the corresponding stat value for the current iteration
+            for stat_name, stat_value in losses.items():
+                if isinstance(stat_value, torch.Tensor):
+                    if stat_name not in history:
+                        history[stat_name] = []
+                    history[stat_name].append(stat_value.item())
+                elif isinstance(stat_value, dict):
+                    for key in stat_value:
+                        key_name = stat_name + '_' + key
+                        if key_name not in history:
+                            history[key_name] = []
+                        history[key_name].append(stat_value[key].item())
 
             # Progress bar text
             if show_progress:
@@ -245,15 +233,10 @@ class VATE(nn.Module):
             
             for _ in range(num_steps):
                 z_next, _, _ = self.transition(z_current)
-                # mu, logvar = self.transition.get_gaussian_params(z_current)
-                # std = torch.exp(0.5 * logvar)
-                # eps = torch.randn_like(std)
-                # z_next = mu + std * eps * 2
-
                 zs.append(z_next)
                 z_current = z_next
 
-            z_sequence = torch.cat(zs, dim=2).squeeze()                         # (num_steps+1, Z)
+            z_sequence = torch.cat(zs, dim=-2).squeeze()                         # (num_steps+1, Z)
 
             # Decode targets
             target_preds = {

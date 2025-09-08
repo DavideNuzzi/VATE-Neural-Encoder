@@ -15,7 +15,7 @@ def standardize_shape(x: torch.Tensor) -> torch.Tensor:
         return x.unsqueeze(0)                # (1,T,F)
     return x
 
-def pack_leading_dims(x: torch.Tensor) -> tuple[torch.Tensor, torch.Size]:
+def pack_leading_dims(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Size]:
     """Flatten all leading dims except the last two into batch."""
     shape = x.shape
     x = x.view(-1, *shape[-2:])   # (B*, T, F)
@@ -31,7 +31,7 @@ class GaussianLayer(nn.Module):
     def __init__(self,
                  output_dim: int,
                  *,
-                 logvar_lims: Tuple[float, float] = (-12.0, 2.0),
+                 logvar_lims: Tuple[float, float] = (-12.0, -3.0),
                  fixed_logvar: Optional[float] = None):
         
         super().__init__()
@@ -383,9 +383,6 @@ class PriorControlledEncoder(BaseEncoder):
 
         # Encode the whole sequence with a recurrent module
         h_rnn, _ = self.recurrent_module(x)
-
-        # Unpack the leading dimensions
-        h_rnn = unpack_leading_dims(h_rnn, input_shape)
         
         # Initalize the first latent and the list of latents
         # Note that for t = -1 we assume that z = 0
@@ -405,17 +402,8 @@ class PriorControlledEncoder(BaseEncoder):
             s_t = self.body_module(s_t)
 
             # The tentative z_t is computed using the transition module
-            mu_trans, _ = self.transition_module.gaussian_module.get_params(s_t)
-            mu_enc, logvar = self.gaussian_module.get_params(s_t) # WRONG
-
-            # ---------------------------------------------------------------------------- #
-            #                            PREVIOUS LINE IS WRONG                            #
-            # ---------------------------------------------------------------------------- #
-            # ------------------------- Should be something like ------------------------- #
-            # ------- mu_p, lv_p = self.transition_module.params_from_prev(z_prev) ------- #
-            # -------------------- def params_from_prev(self, z_prev): ------------------- #
-            # ----------------------- h = self.body_module(z_prev) ----------------------- #
-            # ----------------- return self.gaussian_module.get_params(h) ---------------- #
+            _, mu_trans, _ = self.transition_module.forward(z_prev)
+            mu_enc, logvar = self.gaussian_module.get_params(s_t) 
 
             mu = mu_trans + mu_enc
             z = self.gaussian_module.sample(mu, logvar)
@@ -458,6 +446,10 @@ class BaseDecoder(nn.Module, ABC):
 
     @abstractmethod
     def log_prob(self) -> torch.Tensor:
+        pass
+
+    @abstractmethod
+    def loss(self) -> torch.Tensor:
         pass
 
 
@@ -507,37 +499,81 @@ class RecurrentDiscreteDecoder(BaseDecoder):
 
         return log_p
 
+    def loss(self, logits: torch.Tensor, y_true: torch.Tensor):
 
-# For other types of decoder here's some snippets of code that could be useful
-# # ----- Regression (fixed var): MSELoss -> Gaussian with σ^2 = 1 (const dropped) -----
-# elif isinstance(loss_fn, nn.MSELoss):
-#     # preds_k: mean (K,B,T,...) , targets[name]: (B,T,...)
-#     mu = preds_k
-#     y = targets[name].unsqueeze(0).expand_as(mu)
-#     se = (mu - y) ** 2
-#     sum_dims = tuple(range(2, mu.dim()))                         # sum over time and features
-#     logp_total = - 0.5 * se.sum(dim=sum_dims)
+        B, T, C = logits.shape
 
-# # ----- Regression (heteroscedastic): GaussianNLLLoss -> provide (mu, logvar) -----
-# elif isinstance(loss_fn, nn.GaussianNLLLoss):
-#     # preds_k: tuple (mu, logvar), each (K,B,T,...) matching targets
-#     mu, logvar = preds_k  # expect a tuple from your decoder
-#     y = targets[name].unsqueeze(0).expand_as(mu)
-#     inv_var = torch.exp(-logvar)
-#     # log N(y | mu, var) up to additive constant
-#     logp_elem = -0.5 * ((y - mu) ** 2 * inv_var + logvar)
-#     sum_dims = tuple(range(2, mu.dim()))
-#     logp_total = logp_elem.sum(dim=sum_dims)
+        # For cross entropy I need a 2D tensor for the predictions and 1D for the
+        # true labels (assuming tensor of class indices)
+        logits = logits.view(B * T, C)
+        y_true = y_true.view(B * T)
 
-# # Optional: L1Loss as Laplace(μ, b=1) up to const
-# elif isinstance(loss_fn, nn.L1Loss):
-#     mu = preds_k
-#     y = targets[name].unsqueeze(0).expand_as(mu)
-#     abs_err = (mu - y).abs()
-#     sum_dims = tuple(range(2, mu.dim()))
-#     logp_total = -abs_err.sum(dim=sum_dims)     
+        # Compute cross-entropy (sum over time, average over batch)
+        return nn.functional.cross_entropy(logits, y_true) * T
 
 
+
+
+class RecurrentContinuousDecoder(BaseDecoder):
+    
+    def __init__(self,
+                 *,
+                 recurrent_module: nn.Module,
+                 body_module: Optional[nn.Module] = None,
+                 output_dim: int
+                 ):
+        
+        super().__init__()
+        
+        self.recurrent_module = recurrent_module
+        self.body_module = body_module
+        self.decoder_head = nn.LazyLinear(output_dim)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+
+        z, input_shape = pack_leading_dims(z)
+        h, _ = self.recurrent_module(z)
+        h = unpack_leading_dims(h, input_shape)
+
+        if self.body_module is not None:
+            h = self.body_module(h)
+        y = self.decoder_head(h)
+
+        return y
+    
+    # For continuous data assume a simple gaussian with unitary variance
+    # So an MSE loss
+    def log_prob(self, y_pred: torch.Tensor, y_true: torch.Tensor):
+
+        return -0.5 * (LOG2PI + (y_pred - y_true)**2 ).sum(dim=-1)
+
+    # Simple MSE loss
+    def loss(self, y_pred: torch.Tensor, y_true: torch.Tensor):
+        
+        return ((y_pred - y_true)**2).sum(dim=-1).sum(dim=-1).mean()
+
+
+
+class ResidualBlock(nn.Module):
+    """
+    A modern residual block with Layer Normalization.
+    It uses a bottleneck structure to be more parameter-efficient.
+    """
+    def __init__(self, main_dim: int, expand_factor: int = 2):
+        super().__init__()
+        self.block = nn.Sequential(
+            # First layer expands the features
+            nn.Linear(main_dim, main_dim * expand_factor),
+            nn.LayerNorm(main_dim * expand_factor),
+            nn.GELU(),
+            # Second layer brings it back to the original dimension
+            nn.Linear(main_dim * expand_factor, main_dim)
+        )
+
+    def forward(self, x):
+        # The skip connection is the key!
+        return x + self.block(x)
+    
 # ----------------------------------- ALTRO ---------------------------------- #
 class _GradReverseFn(torch.autograd.Function):
     """Identity in the forward pass, sign-flips and scales the gradient on the way back."""
@@ -602,4 +638,5 @@ class HypersphereLimiter(nn.Module):
     def forward(self, x):
         radius = x.norm(dim=-1, keepdim=True)        
         return x / (radius + 1e-9) * self.radius
+
 
