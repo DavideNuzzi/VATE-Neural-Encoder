@@ -203,7 +203,7 @@ class VATE(nn.Module):
             decoder = self.target_decoders[name] 
             loss_targets_prior[name] = decoder.loss(pred, target_label_true) # type: ignore
         
-        total_loss = self.multistep_consistency_weight * loss_transition + sum(loss_targets.values())
+        total_loss = self.transition_weight * loss_transition + sum(loss_targets.values())
         total_loss = total_loss + self.prior_weight * loss_prior + self.repulsion_weight * loss_repulsive 
         
         if self.multistep_consistency_weight > 0:
