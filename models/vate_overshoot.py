@@ -24,14 +24,23 @@ class VATE(nn.Module):
         encoder: BaseEncoder,
         transition: Transition,
         target_decoders: Mapping[str, BaseDecoder],
-        decode_from_posterior: bool = True
+        transition_weight: float = 1,
+        prior_weight: float = 0.01,
+        repulsion_weight: float = 1,
+        multistep_consistency_weight: float = 0,
+        prior_decoding_weight: float = 0
     ):
         super().__init__()
         self.encoder = encoder
         self.transition = transition
         self.target_decoders = nn.ModuleDict(target_decoders)
 
-        self.decode_from_posterior = decode_from_posterior
+        self.transition_weight = transition_weight
+        self.prior_weight = prior_weight
+
+        self.repulsion_weight = repulsion_weight
+        self.multistep_consistency_weight = multistep_consistency_weight
+        self.prior_decoding_weight = prior_decoding_weight
 
     # Forward should just produce all the means, logvars, z samples, target predictions
     def forward(self, x: torch.Tensor, overshoot_window: int = 0) -> Dict[str, Any]:
@@ -133,7 +142,7 @@ class VATE(nn.Module):
             loss_targets_prior[name] = decoder.loss(pred, target_label_true) # type: ignore
 
         total_loss = loss_prior + loss_transition + sum(loss_targets.values())
-        total_loss = total_loss + loss_multistep_consistency + loss_targets_prior
+        total_loss = total_loss + loss_multistep_consistency + sum(loss_targets_prior.values())
         
         return {
             'total_loss': total_loss,
@@ -161,6 +170,13 @@ class VATE(nn.Module):
         z_trans = forward_output['z_trans_base']
         target_preds = forward_output['target_preds_base']
 
+        # "Prior" terms (put latents near the origin, but far from themselves)
+        loss_prior = (z_enc**2).sum(dim=-1).sum(dim=-1).mean()
+
+        z_enc_flatten = z_enc.reshape(z_enc.shape[0]*z_enc.shape[1], -1)
+        z_dist = torch.cdist(z_enc_flatten, z_enc_flatten, p=2)
+        loss_repulsive = torch.exp(-z_dist).mean()
+        
         # Transition loss
         loss_transition = ((z_enc[:, 1:, :] - z_trans[:, :-1, :])**2).sum(dim=-1).sum(dim=-1).mean()
 
@@ -171,8 +187,6 @@ class VATE(nn.Module):
             target_label_true = y_target_base[name]
             decoder = self.target_decoders[name] 
             loss_targets[name] = decoder.loss(pred, target_label_true) # type: ignore
-
-        total_loss = loss_transition + sum(loss_targets.values())
 
         # Overshoot part
         z_enc_overshoot = forward_output['z_enc_overshoot']
@@ -188,17 +202,39 @@ class VATE(nn.Module):
             target_label_true = y_target_overshoot[name]
             decoder = self.target_decoders[name] 
             loss_targets_prior[name] = decoder.loss(pred, target_label_true) # type: ignore
+        
+        total_loss = self.multistep_consistency_weight * loss_transition + sum(loss_targets.values())
+        total_loss = total_loss + self.prior_weight * loss_prior + self.repulsion_weight * loss_repulsive 
+        
+        if self.multistep_consistency_weight > 0:
+            total_loss = total_loss + self.multistep_consistency_weight * loss_multistep_consistency
+        if self.prior_decoding_weight > 0:
+            total_loss = total_loss + sum(loss_targets_prior.values()) * self.prior_decoding_weight
 
+        losses_results = {
+                            'total_loss': total_loss,
+                            'loss_prior': loss_prior,
+                            'loss_transition': loss_transition,
+                            'loss_targets': loss_targets,
+                            'loss_repulsive': loss_repulsive,       
+                          }
+        
+        if self.multistep_consistency_weight > 0:
+            losses_results['loss_multistep_consistency'] = loss_multistep_consistency
+        if self.prior_decoding_weight > 0:
+            losses_results['loss_targets_prior'] = loss_targets_prior
 
-        return {
-            'total_loss': total_loss,
-            'loss_transition': loss_transition,
-            'loss_targets': loss_targets,
-            'loss_multistep_consistency': loss_multistep_consistency,
-            'loss_targets_prior': loss_targets_prior
-        }
+        return losses_results
+        #     'total_loss': total_loss,
+        #     'loss_prior': loss_prior,
+        #     'loss_transition': loss_transition,
+        #     'loss_targets': loss_targets,
+        #     'loss_repulsive': loss_repulsive,
+        #     'loss_multistep_consistency': loss_multistep_consistency,
+        #     'loss_targets_prior': loss_targets_prior
+        # }
     
-
+    
 
     def fit(self,
             dataset,
@@ -299,7 +335,8 @@ class VATE(nn.Module):
             zs = [z_current]
             
             for _ in range(num_steps):
-                z_next, _, _ = self.transition(z_current)
+                z_next, mu_next, _ = self.transition(z_current)
+                # z_next = mu_next
                 zs.append(z_next)
                 z_current = z_next
 
