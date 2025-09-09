@@ -16,7 +16,7 @@ def _kl_div_standard(mu, logvar):
 def _kl_div(mu_1, mu_2, logvar_1, logvar_2):
     return 0.5 * ((logvar_1 - logvar_2).exp() + (mu_1 - mu_2)**2 / logvar_2.exp() +  logvar_2 - logvar_1 - 1)
 
-
+# Variational Autoregressive Trajectory Encoder
 class VATE(nn.Module):
 
     def __init__(
